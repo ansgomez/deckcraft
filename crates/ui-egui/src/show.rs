@@ -7,9 +7,11 @@ use deckcraft_model::text::Hyperlink;
 use deckcraft_model::{Presentation, ShapeId};
 use deckcraft_render::{ParaState, PlacedLink, PlacedShape, RenderOpts, ShapeState};
 use egui::{Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, pos2, vec2};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::SlideApp;
+use crate::icons::Icon;
+use crate::show_ink::{PALETTE, ShowInk, ShowStroke, ShowTool, smooth_stroke};
 use crate::theme;
 
 pub struct Show {
@@ -44,10 +46,24 @@ pub struct Show {
     pub zoom_arm: bool,
     zoom: Option<Zoom>,
     thumbs: Vec<(usize, TextureHandle)>,
-    pen: bool,
-    /// A dot that follows the pointer and leaves no ink (`Cmd/Ctrl+L`).
-    laser: bool,
-    strokes: Vec<Vec<Pos2>>,
+    ink: ShowInk,
+    /// The slide an erase gesture started on (the gesture only erases there).
+    erase_slide: Option<usize>,
+    /// The keep-ink prompt is up (show stays alive until answered).
+    ask_keep: bool,
+    /// A scripted answer waiting for the prompt (`show.end {keep}`).
+    pending_keep: Option<bool>,
+    /// Laser pointer trail: (screen pos, timestamp), newest last.
+    laser_trail: Vec<(Pos2, f64)>,
+    /// The on-screen control bar's rect while visible (for click hit-testing).
+    bar_rect: Option<Rect>,
+    /// The bar's measured content width (re-measured every frame it is drawn).
+    bar_measured: Option<f32>,
+    /// The bar's measured width with ALL extras (swatches + dots) drawn; decides whether the
+    /// window is wide enough for them (never fed back into itself, so it can't oscillate).
+    bar_full: Option<f32>,
+    /// When the keep-ink prompt opened (rehearse timing must not absorb the dwell).
+    ask_since: f64,
     /// Digits typed for Go to Slide, shown until Enter, Esc, or a short pause.
     goto: String,
     goto_at: f64,
@@ -295,9 +311,15 @@ impl Show {
             zoom_arm: false,
             zoom: None,
             thumbs: vec![],
-            pen: false,
-            laser: false,
-            strokes: vec![],
+            ink: ShowInk::new(doc.show.pen_color),
+            erase_slide: None,
+            ask_keep: false,
+            pending_keep: None,
+            laser_trail: vec![],
+            bar_rect: None,
+            bar_measured: None,
+            bar_full: None,
+            ask_since: 0.0,
             goto: String::new(),
             goto_at: 0.0,
             started: false,
@@ -319,27 +341,6 @@ impl Show {
     /// True while the pointer moved in the last 2.5 s; the media controls and GIF button hide after that.
     fn pointer_awake(&self, now: f64) -> bool {
         now - self.last_move < 2.5
-    }
-
-    /// Pen and laser are different pointers: turning one on puts the other away.
-    fn set_pen(&mut self, on: bool) {
-        self.pen = on;
-        if on {
-            self.laser = false;
-        }
-    }
-
-    fn set_laser(&mut self, on: bool) {
-        self.laser = on;
-        if on {
-            self.pen = false;
-        }
-    }
-
-    /// The arrow pointer: no ink and no laser dot.
-    fn arrow(&mut self) {
-        self.pen = false;
-        self.laser = false;
     }
 
     /// The backdrop for `key`: kept from earlier, waited for if it is being rendered ahead of
@@ -431,7 +432,10 @@ impl Show {
                 self.step_start = now;
                 self.step_end = now;
                 self.media_clock = None;
-                self.strokes.clear();
+                // A stroke in progress ends at the slide boundary (like PowerPoint).
+                self.ink.end();
+                self.ink.end_erase();
+                self.erase_slide = None;
                 if self.preview_only {
                     return false;
                 }
@@ -439,6 +443,9 @@ impl Show {
             }
             ShowAction::End => {
                 self.ended = true;
+                self.ink.end();
+                self.ink.end_erase();
+                self.erase_slide = None;
                 if self.preview_only {
                     return false;
                 }
@@ -549,6 +556,10 @@ fn quad_mesh(tex: Option<egui::TextureId>, rect: Rect, l: &Layer, color: Color32
     m
 }
 
+/// Width of the bar's extras section (8 swatches + 4 width dots + spacing) for the
+/// compact-mode estimate of the full bar width.
+const EXTRAS_W: f32 = 336.0;
+
 /// Render the backgrounds and contents of a transition's two slides into textures, once.
 fn part_textures(ctx: &egui::Context, doc: &Presentation, from: Option<usize>, to: usize, size: (u32, u32)) -> [Option<TextureHandle>; 4] {
     use deckcraft_render::SlidePart;
@@ -569,7 +580,10 @@ fn part_textures(ctx: &egui::Context, doc: &Presentation, from: Option<usize>, t
 /// Read the current viewport's show keys before its widgets can consume them. Both the
 /// audience window and Presenter View use this path, including animation steps and end-of-show.
 /// `presenter` is true for Presenter View, where G opens that window's own grid (#1130).
-fn keyboard(ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, presenter: bool) -> bool {
+///
+/// Returns `(keep, keep_answer)`: `keep = false` ends the show, `keep_answer` answers the modal
+/// keep-ink prompt (while it is up, keys go only to the dialog).
+fn keyboard(ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, presenter: bool) -> (bool, Option<bool>) {
     let keys: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
         i.events
             .iter()
@@ -577,12 +591,19 @@ fn keyboard(ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, 
             .collect()
     });
     let mut keep = true;
+    let mut keep_answer: Option<bool> = None;
     let mut actions = vec![];
     for (k, m) in keys {
         use egui::Key::*;
         let presenter_grid = presenter && show.presenter_grid;
         let grid_open = if presenter { show.presenter_grid } else { show.grid };
-        if grid_open && !matches!(k, Escape | Minus) {
+        if show.ask_keep {
+            match k {
+                Enter | Y => keep_answer = Some(true),
+                Escape | N => keep_answer = Some(false),
+                _ => {}
+            }
+        } else if grid_open && !matches!(k, Escape | Minus) {
             // See All Slides takes no other keys until a slide is chosen.
             if k == G && plain(m) {
                 if presenter_grid {
@@ -628,9 +649,14 @@ fn keyboard(ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, 
                     show.ended = false;
                     actions.push(show.state.prev(doc));
                 }
-                P if m.command => show.set_pen(!show.pen),
-                L if m.command => show.set_laser(!show.laser),
-                A if m.command => show.arrow(),
+                P if m.command => show.ink.toggle(ShowTool::Pen),
+                I if m.command => show.ink.toggle(ShowTool::Highlighter),
+                E if m.command => show.ink.toggle(ShowTool::Eraser),
+                L if m.command => show.ink.toggle(ShowTool::Laser),
+                A if m.command => show.ink.set_tool(ShowTool::Pointer),
+                Z if m.command && !m.shift => {
+                    show.ink.undo();
+                }
                 Home => {
                     if let Some(i) = show.state.first_index(doc) {
                         actions.push(show.state.goto(doc, i));
@@ -643,11 +669,15 @@ fn keyboard(ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, 
                 }
                 B | Period => toggle_blank(show, Color32::BLACK),
                 W | Comma => toggle_blank(show, Color32::WHITE),
-                E => show.strokes.clear(),
+                E if !m.command => show.ink.clear_slide(show.state.slide),
+                C if plain(m) => show.ink.cycle_color(),
                 G if plain(m) => show.open_grid(presenter),
                 Z if plain(m) => show.zoom_key(),
                 T if plain(m) => show.timer.toggle(now),
                 R if plain(m) => show.timer.reset(now),
+                // `[`/`]` step the ink width while a pen tool is out, else the presenter notes size.
+                OpenBracket if plain(m) && matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) => show.ink.step_width(false),
+                CloseBracket if plain(m) && matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) => show.ink.step_width(true),
                 OpenBracket if plain(m) => show.nudge_notes(-NOTES_STEP),
                 CloseBracket if plain(m) => show.nudge_notes(NOTES_STEP),
                 Num0 | Num1 | Num2 | Num3 | Num4 | Num5 | Num6 | Num7 | Num8 | Num9 => {
@@ -668,7 +698,7 @@ fn keyboard(ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, 
             keep = false;
         }
     }
-    keep
+    (keep, keep_answer)
 }
 
 pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
@@ -691,27 +721,42 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         }
         show.after_enter(&doc, now);
     }
-    let mut keep = keyboard(&ctx, &mut show, &doc, now, false);
+    let (mut keep, mut keep_answer) = keyboard(&ctx, &mut show, &doc, now, false);
     let (clicked, secondary, moved) = ctx.input(|i| (i.pointer.primary_clicked(), i.pointer.secondary_clicked(), i.pointer.delta().length() > 0.0));
     if moved {
         show.last_move = now;
     }
+    // While the keep-ink prompt is up, clicks go only to the dialog (keys are handled in
+    // `keyboard` above).
+    let (clicked, secondary) = if show.ask_keep { (false, false) } else { (clicked, secondary) };
     let mut actions: Vec<ShowAction> = vec![];
     let full = ui.max_rect();
     let avail = if show.reading { Rect::from_min_max(full.min, pos2(full.max.x, full.max.y - 34.0)) } else { full };
     let srect = fit(avail, &doc);
-    let pointer = ctx.input(|i| i.pointer.interact_pos());
+    // The control bar's rect for this frame, computed before input so hit-testing below never
+    // works from a stale frame. The bar is always visible during the show (all annotation
+    // tools at hand), except on the end-of-show screen, in See All Slides, and under the keep
+    // prompt.
+    show.bar_rect = if !show.reading && !show.ask_keep && !show.ended && !show.grid {
+        Some(Rect::from_min_size(pos2(full.min.x + 20.0, full.max.y - 50.0), vec2(show.bar_width(full.width()), 34.0)))
+    } else {
+        None
+    };
     show.expire_goto(now);
     // The clock of the triggered animations runs before anything reacts to the pointer.
     show.tick_triggers(&doc, now);
-    let on_slide = !show.grid
-        && !show.pen
-        && !show.laser
+    // Laser clicks still advance the show (the laser is a pointer, not an ink tool).
+    let pointer = matches!(show.ink.tool(), ShowTool::Pointer | ShowTool::Laser);
+    let bar_hit = show.reading_bar_hit(&ctx);
+    // Links, media and GIF controls react to the plain arrow only — never mid-draw or while
+    // the laser dot replaces the cursor.
+    let on_slide = show.ink.tool() == ShowTool::Pointer
+        && !show.grid
         && !show.ended
         && show.blank.is_none()
         && show.zoom.is_none()
         && !show.zoom_arm
-        && !show.reading_bar_hit(&ctx)
+        && !bar_hit
         && !pointer_on_media_bar(&ctx, ui, &doc, &show, now);
     // The button is drawn only while the pointer is awake; a hidden button takes no click.
     let gif_click = if clicked && on_slide && doc.show.show_media_controls && show.pointer_awake(now) {
@@ -736,7 +781,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         }
     } else if show.grid && clicked {
         let aspect = slide_aspect(&doc);
-        if let Some(p) = pointer
+        if let Some(p) = ctx.input(|i| i.pointer.interact_pos())
             && let Some(n) = see_all_hit(full, grid_indices(doc.slides.len()).len(), aspect, p)
             && let Some(&i) = grid_indices(doc.slides.len()).get(n)
         {
@@ -746,16 +791,17 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             show.zoom_arm = false;
             actions.push(show.state.goto(&doc, i));
         }
-    } else if clicked && show.zoom_arm && !show.reading_bar_hit(&ctx) {
-        if let Some(p) = pointer
+    } else if clicked && show.zoom_arm && !bar_hit {
+        if let Some(p) = ctx.input(|i| i.pointer.interact_pos())
             && let Some((nx, ny)) = norm_on_slide(srect, unit_uv(), p)
         {
             show.zoom = Some(Zoom::at(nx, ny));
             show.zoom_arm = false;
         }
-    } else if clicked && show.zoom.is_some() && !show.pen && !show.reading_bar_hit(&ctx) {
+    } else if clicked && show.zoom.is_some() && pointer && !bar_hit {
         show.dismiss_zoom();
-    } else if clicked && !show.pen && !show.reading_bar_hit(&ctx) && !pointer_on_media_bar(&ctx, ui, &doc, &show, now) {
+    } else if clicked && !bar_hit && !pointer_on_media_bar(&ctx, ui, &doc, &show, now) && (pointer || show.ended) {
+        // The end screen exits on any click, whatever tool is active.
         if show.ended {
             keep = false;
         } else if show.blank.is_some() {
@@ -771,12 +817,13 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             }
         }
     }
-    if secondary && !show.ended && !show.grid && show.zoom.is_none() && !show.zoom_arm {
+    if secondary && !show.ended && !show.grid && show.zoom.is_none() && !show.zoom_arm && !bar_hit {
         actions.push(show.state.prev(&doc));
     }
-    // A trackpad swipe (and the mouse wheel) turns the page. The pen is drawing, so a flick
-    // there stays on the slide. Pinch zoom is not a show gesture.
-    if !show.pen
+    // A trackpad swipe (and the mouse wheel) turns the page — but not while an ink tool owns
+    // the drag (the pen is drawing, so a flick there stays on the slide). Pinch zoom is not a
+    // show gesture.
+    if pointer
         && let Some(next) = crate::canvas::page_flick(ctx.input(|i| i.smooth_scroll_delta))
         && now - show.last_swipe > 0.35
     {
@@ -798,10 +845,12 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             keep = false;
         }
     }
-    // Step clock.
+    // Step clock (frozen while the keep-ink prompt is up).
     let (step, playing) = (show.state.step, show.state.playing);
     let t_step = if playing { now - show.step_start } else { 0.0 };
-    if playing {
+    if show.ask_keep {
+        // Modal: no auto-advance, no media churn behind the dialog.
+    } else if playing {
         let dur = show.timeline(&doc).step_duration(step);
         if t_step >= dur {
             actions.push(show.state.step_done(&doc));
@@ -826,13 +875,15 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             keep = false;
         }
     }
-    if show.state.playing {
-        let step = show.state.step;
-        show.cue_media(&doc, step, now - show.step_start);
+    if !show.ask_keep {
+        if show.state.playing {
+            let step = show.state.step;
+            show.cue_media(&doc, step, now - show.step_start);
+        }
+        show_media(app, &mut show, doc_uid, &doc);
+        run_media_cues(app, &mut show, doc_uid, &doc);
     }
-    show_media(app, &mut show, doc_uid, &doc);
-    run_media_cues(app, &mut show, doc_uid, &doc);
-    // Draw.
+    // Draw (`full` and `bar_rect` were computed before input handling).
     let painter = ui.painter_at(full);
     painter.rect_filled(full, CornerRadius::ZERO, Color32::BLACK);
     let ppp = ctx.pixels_per_point();
@@ -1051,7 +1102,9 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             // Not while zoomed: the controls sit where the whole slide would be.
             if doc.show.show_media_controls && !show.zoom_arm && show.zoom.is_none() {
                 let k = srect.width() / sw.max(1.0);
-                if let Some(p) = ctx.input(|i| i.pointer.hover_pos()).filter(|_| !show.pen && !show.laser && show.pointer_awake(now)) {
+                if let Some(p) =
+                    ctx.input(|i| i.pointer.hover_pos()).filter(|_| show.ink.tool() == ShowTool::Pointer && show.pointer_awake(now))
+                {
                     for g in &gifs {
                         let r = on_screen(srect, k, &g.rect);
                         if r.contains(p) {
@@ -1093,46 +1146,93 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         painter.text(r.center(), Align2::CENTER_CENTER, label, theme::font(18.0), Color32::WHITE);
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
-    // Pen.
-    let resp = ui.interact(full, ui.id().with("show_pen"), if show.pen { Sense::drag() } else { Sense::hover() });
-    if show.pen {
-        if resp.drag_started() {
-            show.strokes.push(vec![]);
-        }
-        let uv = show.zoom_uv();
-        if resp.dragged()
+    // Pen / highlighter / eraser / laser. No ink input while a transition is running: the
+    // paint gate hides ink then, so drawing would be invisible.
+    let drawing = matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) && !show.ended && show.trans.is_none() && !show.ask_keep;
+    let erasing = show.ink.tool() == ShowTool::Eraser && !show.ended && show.trans.is_none() && !show.ask_keep;
+    let lasering = show.ink.tool() == ShowTool::Laser && !show.ended && !show.ask_keep;
+    let mut eraser_pos: Option<Pos2> = None;
+    let over_bar = show.bar_rect.is_some_and(|b| ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| b.contains(p)));
+    let resp = ui.interact(full, ui.id().with("show_pen"), if drawing || erasing { Sense::click_and_drag() } else { Sense::hover() });
+    // Ink coordinates normalized to the slide, through the zoom window while zoomed.
+    let ink_uv = show.zoom_uv();
+    let norm = |p: Pos2| {
+        let (u, v) = ((p.x - srect.min.x) / srect.width().max(1.0), (p.y - srect.min.y) / srect.height().max(1.0));
+        (ink_uv.min.x + u * ink_uv.width(), ink_uv.min.y + v * ink_uv.height())
+    };
+    if drawing {
+        let pressed = ctx.input(|i| i.pointer.primary_pressed());
+        if resp.is_pointer_button_down_on()
             && let Some(p) = resp.interact_pointer_pos()
-            && let Some((nx, ny)) = norm_on_slide(srect, uv, p)
-            && let Some(s) = show.strokes.last_mut()
         {
-            s.push(pos2(nx, ny));
+            let (x, y) = norm(p);
+            if show.ink.open() {
+                show.ink.push(show.state.slide, x, y);
+            } else if pressed && !bar_hit {
+                // Begin on the press itself so a stationary click still draws a dot — but
+                // never from a press on the control bar (egui reports both hits there).
+                show.ink.begin(show.state.slide, x, y);
+            }
+        }
+        if !resp.is_pointer_button_down_on() {
+            show.ink.end();
         }
         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-    } else if show.laser {
+    } else if erasing {
+        let pressed = ctx.input(|i| i.pointer.primary_pressed());
+        if resp.is_pointer_button_down_on() {
+            // The erase gesture stays on the slide where it started: a slide change mid-drag
+            // must not erase ink on the slide just landed on. Presses on the control bar
+            // start no gesture.
+            if show.erase_slide.is_none() && pressed && !bar_hit {
+                show.erase_slide = Some(show.state.slide);
+                show.ink.start_erase();
+            }
+            if let (Some(s), Some(p)) = (show.erase_slide, resp.interact_pointer_pos()) {
+                let (x, y) = norm(p);
+                let ink_k = srect.width() / (doc.slide_size.width.max(1.0) as f32 * ink_uv.width().max(1e-4));
+                // 10px tolerance in slide units (points).
+                show.ink.erase_at(s, x, y, 10.0 / ink_k.max(0.01), doc.slide_size.width, doc.slide_size.height);
+            }
+        } else {
+            show.erase_slide = None;
+            show.ink.end_erase();
+        }
+        eraser_pos = resp.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.hover_pos()));
         ctx.set_cursor_icon(egui::CursorIcon::None);
     } else if show.zoom_arm || show.grid {
         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-    } else if !show.pointer_awake(now) && !show.reading {
-        // Idle first: a still pointer hides also over a clickable shape, such as a playing clip.
+    } else if !show.pointer_awake(now) && !show.reading && !over_bar {
+        // Idle first: a still pointer hides also over a clickable shape, such as a playing clip —
+        // but never while hovering the (always visible) bar.
         ctx.set_cursor_icon(egui::CursorIcon::None);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     } else if pointing {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    } else if lasering {
+        // The laser dot replaces the cursor. The fading trail needs frames only while the
+        // pointer moves or the trail is still fading.
+        ctx.set_cursor_icon(egui::CursorIcon::None);
+        if moved && let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+            show.laser_trail.push((p, now));
+            if show.laser_trail.len() > 240 {
+                show.laser_trail.drain(..show.laser_trail.len() - 240);
+            }
+        }
+        if !show.laser_trail.is_empty() {
+            ctx.request_repaint();
+        }
+    } else if !show.pointer_awake(now) && !show.reading {
+        // Idle over the (always visible) bar: the cursor stays.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
-    let pen_col = theme::to_color32(doc.show.pen_color);
-    let uv = show.zoom_uv();
-    for s in &show.strokes {
-        let pts: Vec<Pos2> = s.iter().map(|q| slide_to_screen(srect, uv, q.x, q.y)).collect();
-        painter.add(egui::Shape::line(pts, Stroke::new(3.0, pen_col)));
+    if !lasering && !show.laser_trail.is_empty() {
+        show.laser_trail.clear();
     }
-    if show.laser
-        && !show.ended
-        && let Some(p) = ctx.input(|i| i.pointer.hover_pos())
-    {
-        let c = theme::to_color32(doc.show.laser_color);
-        painter.circle_filled(p, 16.0, Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 70));
-        painter.circle_filled(p, 5.5, c);
+    // Ink of the current slide (hidden during transitions and on the end-of-show screen —
+    // except under the keep prompt, so the user sees what they are keeping).
+    if show.trans.is_none() && (!show.ended || show.ask_keep) {
+        paint_ink(&painter, srect, ink_uv, doc.slide_size.width, show.ink.strokes(show.state.slide));
     }
     if show.zoom_arm && !show.grid {
         painter.text(
@@ -1159,25 +1259,35 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
                 .max_rect(Rect::from_min_max(pos2(bar.max.x - 260.0, bar.min.y), bar.max))
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
-        if child.button("Close").clicked() {
+        // The keep-ink prompt is modal: the reading bar is inert while it is up.
+        if !show.ask_keep && child.button("Close").clicked() {
             keep = false;
         }
-        if child.button("▶").clicked() {
+        if !show.ask_keep && child.button("▶").clicked() {
             let a = show.state.next(&doc);
             if !show.apply(a, &doc, now) {
                 keep = false;
             }
         }
-        if child.button("◀").clicked() {
+        if !show.ask_keep && child.button("◀").clicked() {
             let a = show.state.prev(&doc);
             show.apply(a, &doc, now);
         }
-    } else if !show.grid && (show.pointer_awake(now) || show.zoom_arm) {
-        let bar = tool_bar_rect(full);
+    } else if let Some(bar) = show.bar_rect {
         painter.rect_filled(bar, CornerRadius::same(17), Color32::from_black_alpha(140));
         let mut child =
             ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(vec2(10.0, 4.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
         let b = |ui: &mut Ui, s: &str| ui.add(egui::Button::new(egui::RichText::new(s).color(Color32::WHITE).size(15.0)).frame(false));
+        // Icon tool button: vector icon from the icon set, highlighted while active.
+        let ib = |ui: &mut Ui, icon: Icon, label: &str, on: bool, sc: &str| -> egui::Response {
+            let resp = ui.add(egui::Button::new("").frame(false).min_size(vec2(26.0, 22.0)));
+            if on {
+                ui.painter().rect_filled(resp.rect, CornerRadius::same(5), Color32::from_white_alpha(36));
+            }
+            crate::icons::paint(ui.painter(), resp.rect.shrink(3.0), icon, Color32::WHITE, false);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+            resp.on_hover_text(format!("{label} ({sc})"))
+        };
         if b(&mut child, "◀").clicked() {
             let a = show.state.prev(&doc);
             show.apply(a, &doc, now);
@@ -1188,11 +1298,72 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
                 keep = false;
             }
         }
-        if b(&mut child, if show.pen { "✏ on" } else { "✏" }).clicked() {
-            show.set_pen(!show.pen);
+        if ib(&mut child, Icon::Pen, "Pen", show.ink.tool() == ShowTool::Pen, &crate::ribbon::pretty_shortcut("Cmd+P")).clicked() {
+            show.ink.toggle(ShowTool::Pen);
         }
-        if b(&mut child, if show.laser { "◉ on" } else { "◉" }).clicked() {
-            show.set_laser(!show.laser);
+        if ib(&mut child, Icon::HighlighterPen, "Highlighter", show.ink.tool() == ShowTool::Highlighter, &crate::ribbon::pretty_shortcut("Cmd+I"))
+            .clicked()
+        {
+            show.ink.toggle(ShowTool::Highlighter);
+        }
+        if ib(&mut child, Icon::Eraser, "Eraser", show.ink.tool() == ShowTool::Eraser, &crate::ribbon::pretty_shortcut("Cmd+E")).clicked() {
+            show.ink.toggle(ShowTool::Eraser);
+        }
+        if ib(&mut child, Icon::LaserPointer, "Laser pointer", show.ink.tool() == ShowTool::Laser, &crate::ribbon::pretty_shortcut("Cmd+L")).clicked()
+        {
+            show.ink.toggle(ShowTool::Laser);
+        }
+        // Color swatches and width dots, whenever the full bar fits the window (narrow
+        // windows get the compact bar without them).
+        let roomy = show.bar_full.is_none_or(|fw| fw + 40.0 <= full.width());
+        if roomy {
+            let cur = show.ink.tool_color();
+            for &(name, c) in PALETTE.iter() {
+                let swatch =
+                    egui::Button::new("  ").fill(theme::to_color32(c)).stroke(Stroke::new(1.0, Color32::from_gray(90))).min_size(vec2(22.0, 18.0));
+                let resp = child.add(swatch);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+                let resp = resp.on_hover_text(name);
+                if cur == c {
+                    // Ring outside the fill so it also shows on the white swatch.
+                    let ring = if c.luminance() > 0.6 { Color32::from_gray(20) } else { Color32::WHITE };
+                    child.painter().rect_stroke(resp.rect.expand(2.0), CornerRadius::same(3), Stroke::new(1.5, ring), egui::StrokeKind::Outside);
+                }
+                if resp.clicked() {
+                    if !matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) {
+                        show.ink.set_tool(ShowTool::Pen);
+                    }
+                    show.ink.set_color(c);
+                }
+            }
+            // Width quick-picks drawn as dots of their size (`[` / `]` from the keyboard).
+            let cur_w = show.ink.tool_width();
+            for &w in show.ink.width_dots().iter() {
+                let resp = child.add(egui::Button::new("  ").frame(false).min_size(vec2(22.0, 18.0)));
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Width {w} pt")));
+                let resp = resp.on_hover_text(format!("{w} pt"));
+                let on = (cur_w - w).abs() < 0.001;
+                let dot = if on {
+                    Color32::WHITE
+                } else if resp.hovered() {
+                    Color32::from_gray(220)
+                } else {
+                    Color32::from_gray(150)
+                };
+                child.painter().circle_filled(resp.rect.center(), (w as f32 * 0.9).clamp(1.5, 8.0), dot);
+                if resp.clicked() {
+                    if !matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) {
+                        show.ink.set_tool(ShowTool::Pen);
+                    }
+                    show.ink.set_width(w);
+                }
+            }
+        }
+        if b(&mut child, "Undo").on_hover_text(format!("Undo ink ({})", crate::ribbon::pretty_shortcut("Cmd+Z"))).clicked() {
+            show.ink.undo();
+        }
+        if b(&mut child, "Clear").on_hover_text("Clear this slide's ink (E)").clicked() {
+            show.ink.clear_slide(show.state.slide);
         }
         if b(&mut child, "Black").clicked() {
             toggle_blank(&mut show, Color32::BLACK);
@@ -1209,7 +1380,76 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         if b(&mut child, "End").clicked() {
             keep = false;
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        // Re-measure the content so the pill and its click-guard match reality. Compact
+        // frames still estimate the full width (extras are fixed-size), so widening the
+        // window restores the swatches and dots immediately.
+        let measured = (child.min_rect().width() + 20.0).ceil();
+        show.bar_measured = Some(measured);
+        show.bar_full = Some(if roomy { measured } else { measured + EXTRAS_W });
+        // Keep frames coming so the idle-cursor hide can trigger.
+        ctx.request_repaint_after(std::time::Duration::from_millis(600));
+    }
+    // Eraser cursor ring, on top of everything (two-tone so it reads on white and black).
+    if let Some(p) = eraser_pos {
+        painter.circle_stroke(p, 10.0, Stroke::new(3.0, Color32::from_black_alpha(200)));
+        painter.circle_stroke(p, 10.0, Stroke::new(1.0, Color32::WHITE));
+    }
+    // Laser pointer: a glowing dot with a smooth, tapered, fading tail.
+    if lasering {
+        let col = theme::to_color32(doc.show.laser_color);
+        let fade = |a: f32| Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (255.0 * a.clamp(0.0, 1.0)) as u8);
+        show.laser_trail.retain(|&(_, t)| now - t < 0.7);
+        let mut raw: Vec<(f32, f32)> = show.laser_trail.iter().map(|&(p, _)| (p.x, p.y)).collect();
+        let dot = ctx.input(|i| i.pointer.hover_pos());
+        if let Some(p) = dot {
+            raw.push((p.x, p.y));
+        }
+        let sm = smooth_stroke(&raw);
+        let n = sm.len();
+        let mut prev: Option<Pos2> = None;
+        for (i, &(x, y)) in sm.iter().enumerate() {
+            let p = pos2(x, y);
+            if let Some(q) = prev {
+                let t = i as f32 / n.max(1) as f32; // 0 at the tail's end → 1 at the dot
+                painter.line_segment([q, p], Stroke::new(0.5 + 3.0 * t, fade(0.30 * t * t)));
+            }
+            prev = Some(p);
+        }
+        if let Some(p) = dot {
+            painter.circle_filled(p, 13.0, fade(0.16));
+            painter.circle_filled(p, 7.5, fade(0.35));
+            painter.circle_filled(p, 4.5, col);
+        }
+    }
+    // Keep-ink prompt (on exit with annotations, like PowerPoint).
+    if show.ask_keep {
+        painter.rect_filled(full, CornerRadius::ZERO, Color32::from_black_alpha(140));
+        let dlg = Rect::from_center_size(full.center(), vec2(400.0, 140.0));
+        painter.rect_filled(dlg, CornerRadius::same(10), Color32::from_gray(36));
+        painter.rect_stroke(dlg, CornerRadius::same(10), Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Inside);
+        painter.text(pos2(dlg.center().x, dlg.min.y + 34.0), Align2::CENTER_CENTER, "Keep ink annotations?", theme::font(17.0), Color32::WHITE);
+        let slides_with_ink = show.ink.by_slide().count();
+        painter.text(
+            pos2(dlg.center().x, dlg.min.y + 62.0),
+            Align2::CENTER_CENTER,
+            format!("{} stroke(s) on {} slide(s)", show.ink.count(), slides_with_ink),
+            theme::font(12.0),
+            Color32::from_gray(190),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_size(pos2(dlg.center().x - 100.0, dlg.max.y - 46.0), vec2(200.0, 30.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let btn = |ui: &mut Ui, s: &str| {
+            ui.add(egui::Button::new(egui::RichText::new(s).color(Color32::WHITE).size(14.0)).fill(Color32::from_gray(70)).min_size(vec2(88.0, 26.0)))
+        };
+        if btn(&mut child, "Keep").clicked() {
+            keep_answer = Some(true);
+        }
+        if btn(&mut child, "Discard").clicked() {
+            keep_answer = Some(false);
+        }
     }
     if show.grid && !show.ended {
         paint_grid(&painter, &ctx, &mut show, &doc, full);
@@ -1228,9 +1468,40 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         );
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
-    // Presenter view in a second window.
-    if keep && show.presenter && !show.reading {
+    // Presenter view in a second window (closed while the modal keep-ink prompt is up).
+    if keep && show.presenter && !show.reading && !show.ask_keep {
         presenter_window(&ctx, &mut show, &doc, now, &mut keep);
+    }
+    // Exiting with annotations: ask first (PowerPoint's "Keep ink annotations?").
+    if !keep && !show.ask_keep && !show.preview_only && show.ink.any() {
+        show.ink.end();
+        show.ink.end_erase();
+        show.erase_slide = None;
+        show.ask_keep = true;
+        show.ask_since = now;
+        keep = true;
+    }
+    // A scripted `show.end {keep}` answer applies as soon as the prompt is up (a manual
+    // click this frame wins over a racing scripted answer).
+    if show.ask_keep
+        && keep_answer.is_none()
+        && let Some(k) = show.pending_keep.take()
+    {
+        keep_answer = Some(k);
+    }
+    if let Some(keep_them) = keep_answer {
+        show.ask_keep = false;
+        // The prompt's dwell must not inflate rehearsed slide timings.
+        show.slide_start += now - show.ask_since;
+        if keep_them {
+            let failed = keep_ink(app, &show, &doc);
+            if failed == 0 {
+                app.set_status("Ink annotations kept.");
+            } else {
+                app.set_status(format!("Ink annotations kept, but {failed} slide(s) failed."));
+            }
+        }
+        keep = false;
     }
     if keep {
         app.show = Some(show);
@@ -1315,6 +1586,54 @@ fn run_media_cues(app: &mut SlideApp, show: &mut Show, doc_uid: u64, doc: &Prese
     }
 }
 
+/// Convert the show's ink annotations into document strokes through `slide.annotate`
+/// (normalized → slide coordinates, clamped to the slide; the renderer applies its own
+/// alpha for highlighter ink, so colors are stored opaque).
+fn keep_ink(app: &mut SlideApp, show: &Show, doc: &Presentation) -> usize {
+    let (sw, sh) = (doc.slide_size.width, doc.slide_size.height);
+    let mut failed = 0;
+    for (slide, strokes) in show.ink().by_slide() {
+        let list: Vec<Value> = strokes
+            .iter()
+            .map(|s| {
+                json!({
+                    // Smoothed, so the kept ink matches what was on screen.
+                    "points": smooth_stroke(&s.points).iter().map(|&(x, y)| [f64::from(x).clamp(0.0, 1.0) * sw, f64::from(y).clamp(0.0, 1.0) * sh]).collect::<Vec<_>>(),
+                    "color": s.color.with_alpha(255).hex(),
+                    "width": s.width,
+                    "highlighter": s.highlighter,
+                })
+            })
+            .collect();
+        if !list.is_empty() && app.run("slide.annotate", json!({"index": slide, "strokes": list})).is_err() {
+            failed += 1;
+        }
+    }
+    failed
+}
+
+/// Paint show ink strokes (normalized coordinates) into a slide rect, smoothed
+/// (`smooth_stroke`) so pen curves don't look like raw polylines. `uv` is the visible window
+/// of the slide (a zoom); stroke width scales with it.
+fn paint_ink(painter: &egui::Painter, r: Rect, uv: Rect, slide_w: f64, strokes: &[ShowStroke]) {
+    let k = r.width() / (slide_w.max(1.0) as f32 * uv.width().max(1e-4));
+    for s in strokes {
+        let col = theme::to_color32(s.color);
+        let w = (s.width as f32 * k).max(1.0);
+        let raw: Vec<(f32, f32)> = s.points.iter().map(|&(x, y)| { let p = slide_to_screen(r, uv, x, y); (p.x, p.y) }).collect();
+        let pts: Vec<Pos2> = smooth_stroke(&raw).iter().map(|&(x, y)| pos2(x, y)).collect();
+        match pts.as_slice() {
+            [p] => {
+                painter.circle_filled(*p, w / 2.0, col);
+            }
+            [_, ..] => {
+                painter.add(egui::Shape::line(pts, Stroke::new(w, col)));
+            }
+            [] => {}
+        }
+    }
+}
+
 /// Slide rectangle the show draws into (the reading bar keeps its strip).
 fn shown_slide_rect(ui: &Ui, show: &Show, doc: &Presentation) -> Rect {
     let full = ui.max_rect();
@@ -1347,7 +1666,7 @@ fn slide_media_bars(srect: Rect, doc: &Presentation, slide: usize) -> Vec<(Shape
 
 /// The clip whose bar or shape is under the pointer, when Show Media Controls is on.
 fn media_bar_target(ctx: &egui::Context, doc: &Presentation, show: &Show, srect: Rect) -> Option<(ShapeId, deckcraft_model::MediaClip, Rect)> {
-    if !doc.show.show_media_controls || show.pen || show.ended || show.blank.is_some() {
+    if !doc.show.show_media_controls || !matches!(show.ink.tool(), ShowTool::Pointer | ShowTool::Laser) || show.ended || show.blank.is_some() {
         return None;
     }
     let p = ctx.input(|i| i.pointer.hover_pos())?;
@@ -1361,7 +1680,12 @@ fn media_bar_target(ctx: &egui::Context, doc: &Presentation, show: &Show, srect:
 
 /// True when the pointer is on a visible playback bar, so that click must not advance the show.
 fn pointer_on_media_bar(ctx: &egui::Context, ui: &Ui, doc: &Presentation, show: &Show, now: f64) -> bool {
-    if !doc.show.show_media_controls || !show.pointer_awake(now) || show.pen || show.ended || show.blank.is_some() {
+    if !doc.show.show_media_controls
+        || !show.pointer_awake(now)
+        || !matches!(show.ink.tool(), ShowTool::Pointer | ShowTool::Laser)
+        || show.ended
+        || show.blank.is_some()
+    {
         return false;
     }
     let Some(p) = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) else { return false };
@@ -1531,7 +1855,7 @@ impl Show {
             self.dismiss_zoom();
         } else {
             self.zoom_arm = true;
-            self.pen = false;
+            self.ink.set_tool(ShowTool::Pointer);
         }
     }
 
@@ -1612,6 +1936,29 @@ impl Show {
         }
     }
 
+    /// The show's ink state (for the control channel's `ui.inspect`).
+    pub fn ink(&self) -> &ShowInk {
+        &self.ink
+    }
+
+    /// The keep-ink prompt is up (for the control channel).
+    pub fn ask_keep(&self) -> bool {
+        self.ask_keep
+    }
+
+    /// Queue a scripted answer for the keep-ink prompt (`show.end {keep}`).
+    pub fn set_pending_keep(&mut self, keep: bool) {
+        self.pending_keep = Some(keep);
+    }
+
+    /// Width of the bottom-left control bar: the measured content width (full or compact per
+    /// the roomy decision, so content never spills past the pill), clamped to the window.
+    fn bar_width(&self, window_w: f32) -> f32 {
+        let roomy = self.bar_full.is_none_or(|fw| fw + 40.0 <= window_w);
+        let w = if roomy { self.bar_full.or(self.bar_measured).unwrap_or(780.0) } else { self.bar_measured.unwrap_or(780.0) };
+        w.min((window_w - 40.0).max(120.0))
+    }
+
     pub fn showing_value(&self, n_slides: usize, aspect: f32, full: Rect, now: f64) -> serde_json::Value {
         let mut v = json!({
             "slide": self.state.slide,
@@ -1626,6 +1973,10 @@ impl Show {
             "notesPx": self.notes_px,
             "custom": self.state.custom_name(),
             "goto": if self.goto.is_empty() { None } else { Some(self.goto.clone()) },
+            "askKeep": self.ask_keep,
+            "inkTool": self.ink.tool().name(),
+            "strokes": self.ink.strokes(self.state.slide).len(),
+            "totalStrokes": self.ink.count(),
         });
         if self.grid {
             let slides = grid_indices(n_slides);
@@ -1637,10 +1988,11 @@ impl Show {
     }
 
     fn reading_bar_hit(&self, ctx: &egui::Context) -> bool {
-        // Clicks on the on-screen controls must not also advance.
+        // Clicks on the on-screen controls must not also advance. Uses the bar's actual rect
+        // (recorded when drawn), so a hidden bar never swallows clicks.
         ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| {
             let r = ctx.content_rect();
-            (self.reading && p.y > r.max.y - 34.0) || (!self.reading && tool_bar_rect(r).expand(8.0).contains(p))
+            (self.reading && p.y > r.max.y - 34.0) || (!self.reading && self.bar_rect.is_some_and(|bar| bar.contains(p)))
         })
     }
 }
@@ -1649,7 +2001,6 @@ const GOTO_HOLD: f64 = 3.0;
 const GOTO_DIGITS: usize = 4;
 const ZOOM_SCALE: f32 = 2.0;
 const GRID_CAP: usize = 48;
-const TOOL_BAR_W: f32 = 520.0;
 const NOTES_DEFAULT: f32 = 18.0;
 const NOTES_MIN: f32 = 12.0;
 const NOTES_MAX: f32 = 48.0;
@@ -1774,11 +2125,6 @@ fn zoom_frame(slide: Rect, uv: Rect) -> Rect {
 
 fn toggle_blank(show: &mut Show, color: Color32) {
     show.blank = if show.blank == Some(color) { None } else { Some(color) };
-}
-
-fn tool_bar_rect(full: Rect) -> Rect {
-    let w = TOOL_BAR_W.min((full.width() - 32.0).max(32.0));
-    Rect::from_min_size(pos2(full.min.x + 16.0, full.max.y - 50.0), vec2(w, 34.0))
 }
 
 fn grid_indices(n: usize) -> Vec<usize> {
@@ -1965,7 +2311,12 @@ fn presenter_window(ctx: &egui::Context, show: &mut Show, doc: &Presentation, no
         egui::ViewportId::from_hash_of("deckcraft_presenter"),
         egui::ViewportBuilder::default().with_title("Presenter View — DeckCraft").with_inner_size([1100.0, 700.0]),
         |ui, _| {
-            if !keyboard(ui.ctx(), show, doc, now, true) {
+            let (window_keep, answer) = keyboard(ui.ctx(), show, doc, now, true);
+            // The audience window owns the keep-ink prompt; an answer typed here waits for it.
+            if let Some(a) = answer {
+                show.pending_keep = Some(a);
+            }
+            if !window_keep {
                 *keep = false;
             }
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
@@ -2039,6 +2390,12 @@ fn presenter_window(ctx: &egui::Context, show: &mut Show, doc: &Presentation, no
                 let cr = Rect::from_min_size(left.min, cr.size());
                 if let Some(t) = &cur_tex {
                     ui.painter().image(t.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                // Mirror the audience's ink so the presenter sees the annotations too
+                // (clipped to the slide; hidden during transitions like the audience view).
+                if show.trans.is_none() {
+                    let ink_painter = ui.painter().with_clip_rect(cr);
+                    paint_ink(&ink_painter, cr, unit_uv(), doc.slide_size.width, show.ink.strokes(cur));
                 }
                 if let Some(z) = show.zoom {
                     let mark = zoom_frame(cr, z.uv());
@@ -2614,17 +2971,20 @@ mod tests {
 
     #[test]
     fn the_laser_and_the_pen_are_not_on_together() {
+        // One show tool at a time: picking one puts the other away (the ink tool model makes
+        // the old pen/laser bool pair impossible).
         let doc = deckcraft_model::Presentation::default();
         let mut show = Show::new(&doc, 0, false, false);
-        show.set_laser(true);
-        assert!(show.laser && !show.pen);
-        show.set_pen(true);
-        assert!(show.pen && !show.laser);
-        show.set_laser(true);
-        show.arrow();
-        assert!(!show.laser && !show.pen);
-        show.set_laser(false);
-        assert!(!show.laser);
+        show.ink.toggle(ShowTool::Laser);
+        assert_eq!(show.ink.tool(), ShowTool::Laser);
+        show.ink.toggle(ShowTool::Pen);
+        assert_eq!(show.ink.tool(), ShowTool::Pen);
+        show.ink.toggle(ShowTool::Laser);
+        show.ink.set_tool(ShowTool::Pointer);
+        assert_eq!(show.ink.tool(), ShowTool::Pointer);
+        show.ink.toggle(ShowTool::Laser);
+        show.ink.toggle(ShowTool::Laser);
+        assert_eq!(show.ink.tool(), ShowTool::Pointer);
     }
 
     fn deck_with_first_animation(start: deckcraft_model::anim::AnimStart) -> Presentation {
