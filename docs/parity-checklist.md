@@ -212,8 +212,8 @@ Open P0 items: Contextual tabs (Shape Format, Picture Format, Table Design/Layou
 | Slide show | Full-screen show from start / current | P0 | D |
 | Slide show | Navigation (keys, click, go to slide, blank screen) | P0 | D |
 | Slide show | Presenter view (notes, next slide, timer) | P0 | P |
-| Slide show | Pen and highlighter ink during the show | P1 | P |
-| Slide show | Laser pointer | P2 | P |
+| Slide show | Pen and highlighter ink during the show | P1 | D |
+| Slide show | Laser pointer | P2 | D |
 | Slide show | Rehearse timings | P2 | D |
 | Slide show | Custom shows | P2 | D |
 | Slide show | Set up show (loop, kiosk, without animation) | P1 | D |
