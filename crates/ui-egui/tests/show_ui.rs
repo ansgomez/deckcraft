@@ -287,3 +287,40 @@ fn bar_navigation_drops_the_selection_before_the_next_key() {
     assert_eq!(ink.count(), 1, "Delete after navigation must not touch slide 0's ink");
     assert_eq!(ink.selection_len(), 0);
 }
+
+/// A thumbnail click on See All Slides with an ink tool active picks the slide and leaves no ink
+/// (the press used to reach the pen under the grid and leave a dot on the slide being left).
+#[test]
+fn a_grid_click_with_an_ink_tool_leaves_no_ink() {
+    for tool in [egui::Key::P, egui::Key::I] {
+        let mut h = make_show();
+        h.run_steps(2);
+        key(&mut h, tool, true);
+        key(&mut h, egui::Key::G, false);
+        assert!(h.state().show.as_ref().is_some_and(|s| s.grid), "G opened See All Slides");
+        // The middle thumbnail (slide 5 of the sample deck).
+        click(&mut h, (640.0, 400.0));
+        h.run_steps(2);
+        let show = h.state().show.as_ref().expect("show running");
+        assert!(!show.grid, "the click picked a thumbnail");
+        assert_eq!(show.state.slide, 4);
+        assert_eq!(show.ink().count(), 0, "{tool:?}: no ink from a grid click");
+    }
+}
+
+/// The palette colors the laser while it is the active tool (it stays the laser), and the
+/// pen keeps its own color.
+#[test]
+fn a_swatch_colors_the_laser() {
+    let mut h = make_show();
+    h.run_steps(2);
+    let pen_before = h.state().show.as_ref().map(|s| s.ink().pen_color);
+    key(&mut h, egui::Key::L, true);
+    assert_eq!(h.state().show.as_ref().map(|s| s.ink().laser_color), Some(deckcraft_color::Rgba::rgb(0xFF, 0x00, 0x00)), "red by default");
+    h.get_by_label("Blue").click();
+    h.run_steps(2);
+    let ink = h.state().show.as_ref().expect("show running").ink();
+    assert_eq!(ink.tool(), deckcraft_ui_egui::show_ink::ShowTool::Laser, "still the laser");
+    assert_eq!(ink.laser_color, deckcraft_ui_egui::show_ink::PALETTE[4].1);
+    assert_eq!(Some(ink.pen_color), pen_before);
+}

@@ -323,7 +323,11 @@ impl Show {
             zoom_arm: false,
             zoom: None,
             thumbs: vec![],
-            ink: ShowInk::new(doc.show.pen_color),
+            ink: {
+                let mut ink = ShowInk::new(doc.show.pen_color);
+                ink.laser_color = doc.show.laser_color;
+                ink
+            },
             erase_slide: None,
             select_drag: None,
             ask_keep: false,
@@ -1138,9 +1142,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             // Not while zoomed: the controls sit where the whole slide would be.
             if doc.show.show_media_controls && !show.zoom_arm && show.zoom.is_none() {
                 let k = srect.width() / sw.max(1.0);
-                if let Some(p) =
-                    ctx.input(|i| i.pointer.hover_pos()).filter(|_| show.ink.tool() == ShowTool::Pointer && show.pointer_awake(now))
-                {
+                if let Some(p) = ctx.input(|i| i.pointer.hover_pos()).filter(|_| show.ink.tool() == ShowTool::Pointer && show.pointer_awake(now)) {
                     for g in &gifs {
                         let r = on_screen(srect, k, &g.rect);
                         if r.contains(p) {
@@ -1184,10 +1186,11 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
     }
     // Pen / highlighter / eraser / laser / select. No ink input while a transition is
     // running: the paint gate hides ink then, so drawing would be invisible.
-    let drawing = matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) && !show.ended && show.trans.is_none() && !show.ask_keep;
-    let erasing = show.ink.tool() == ShowTool::Eraser && !show.ended && show.trans.is_none() && !show.ask_keep;
-    let lasering = show.ink.tool() == ShowTool::Laser && !show.ended && !show.ask_keep;
-    let selecting = show.ink.tool() == ShowTool::Select && !show.ended && show.trans.is_none() && !show.ask_keep;
+    let live = ink_input_live(&show);
+    let drawing = matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) && live && show.trans.is_none();
+    let erasing = show.ink.tool() == ShowTool::Eraser && live && show.trans.is_none();
+    let lasering = show.ink.tool() == ShowTool::Laser && live;
+    let selecting = show.ink.tool() == ShowTool::Select && live && show.trans.is_none();
     if !selecting && show.select_drag.is_some() {
         // The tool changed mid-gesture: commit the move, drop the marquee.
         show.select_drag = None;
@@ -1503,7 +1506,9 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
                     );
                 }
                 if resp.clicked() {
-                    if !matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter) {
+                    // The pen, highlighter and laser each keep their own color; from any
+                    // other tool a swatch picks up the pen.
+                    if !matches!(show.ink.tool(), ShowTool::Pen | ShowTool::Highlighter | ShowTool::Laser) {
                         show.ink.set_tool(ShowTool::Pen);
                     }
                     show.ink.set_color(c);
@@ -1580,7 +1585,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
     }
     // Laser pointer: a glowing dot with a smooth, tapered, fading tail.
     if lasering {
-        let col = theme::to_color32(doc.show.laser_color);
+        let col = theme::to_color32(show.ink.laser_color);
         let fade = |a: f32| Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (255.0 * a.clamp(0.0, 1.0)) as u8);
         show.laser_trail.retain(|&(_, t)| now - t < 0.7);
         let mut raw: Vec<(f32, f32)> = show.laser_trail.iter().map(|&(p, _)| (p.x, p.y)).collect();
@@ -1869,6 +1874,13 @@ fn media_bar_target(ctx: &egui::Context, doc: &Presentation, show: &Show, srect:
     Some((*id, clip.clone(), *bar))
 }
 
+/// Ink tools take input only on the plain running slide: not on the end screen, under the
+/// keep-ink prompt, over See All Slides (a thumbnail click would ink the slide being left) or
+/// while a zoom waits for its click.
+fn ink_input_live(show: &Show) -> bool {
+    !show.ended && !show.ask_keep && !show.grid && !show.zoom_arm
+}
+
 /// True when the pointer is on a visible playback bar, so that click must not advance the show.
 fn pointer_on_media_bar(ctx: &egui::Context, ui: &Ui, doc: &Presentation, show: &Show, now: f64) -> bool {
     if !doc.show.show_media_controls
@@ -1884,7 +1896,6 @@ fn pointer_on_media_bar(ctx: &egui::Context, ui: &Ui, doc: &Presentation, show: 
     slide_media_bars(srect, doc, show.state.slide).iter().any(|(_, _, _, bar)| bar.contains(p))
 }
 
-/// The media shape under the pointer on the shown slide.
 /// One button of the show's control bars: a vector icon with hover and active fills; greyed
 /// and inert when `enabled` is false.
 fn bar_icon_button(ui: &mut Ui, icon: Icon, label: &str, on: bool, enabled: bool, tip: impl Into<String>) -> egui::Response {
@@ -2089,6 +2100,14 @@ impl Show {
         } else {
             self.dismiss_zoom()
         }
+    }
+
+    /// Close what Esc would back out of first in the audience window (its See All Slides, a
+    /// zoom, a typed slide number), so one Esc leaves the show (`show.end`).
+    pub fn close_overlays(&mut self) {
+        self.grid = false;
+        self.dismiss_zoom();
+        self.clear_goto();
     }
 
     /// Esc backs out of a zoom before it leaves the show. True when it did.
@@ -2531,11 +2550,8 @@ fn presenter_window(ctx: &egui::Context, show: &mut Show, doc: &Presentation, no
         egui::ViewportId::from_hash_of("deckcraft_presenter"),
         egui::ViewportBuilder::default().with_title("Presenter View — DeckCraft").with_inner_size([1100.0, 700.0]),
         |ui, _| {
-            let (window_keep, answer) = keyboard(ui.ctx(), show, doc, now, true);
-            // The audience window owns the keep-ink prompt; an answer typed here waits for it.
-            if let Some(a) = answer {
-                show.pending_keep = Some(a);
-            }
+            // This window is closed while the keep-ink prompt is up, so it never answers it.
+            let (window_keep, _) = keyboard(ui.ctx(), show, doc, now, true);
             if !window_keep {
                 *keep = false;
             }
@@ -3270,6 +3286,36 @@ mod tests {
         let zoomed = zoom_uv(0.5, 0.5, 2.0);
         let back = norm_on_slide(srect, zoomed, pos2(110.0, 70.0)).expect("on the slide");
         assert!((back.0 - 0.5).abs() < 1e-3 && (back.1 - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ink_input_is_off_over_the_grid_and_a_waiting_zoom() {
+        let doc = deckcraft_model::Presentation::default();
+        let mut show = Show::new(&doc, 0, false, false);
+        assert!(ink_input_live(&show));
+        show.grid = true;
+        assert!(!ink_input_live(&show));
+        show.grid = false;
+        show.zoom_arm = true;
+        assert!(!ink_input_live(&show));
+    }
+
+    #[test]
+    fn close_overlays_lets_one_escape_leave_the_show() {
+        let doc = deckcraft_model::Presentation::default();
+        let mut show = Show::new(&doc, 0, false, false);
+        show.grid = true;
+        show.zoom_arm = true;
+        show.close_overlays();
+        assert!(!show.back_out(false), "nothing left for Esc to close: it ends the show");
+    }
+
+    #[test]
+    fn the_laser_starts_in_the_documents_laser_color() {
+        let mut doc = deckcraft_model::Presentation::default();
+        assert_eq!(Show::new(&doc, 0, false, false).ink.laser_color, deckcraft_color::Rgba::rgb(0xFF, 0x00, 0x00));
+        doc.show.laser_color = deckcraft_color::Rgba::rgb(0x00, 0x80, 0xFF);
+        assert_eq!(Show::new(&doc, 0, false, false).ink.laser_color, deckcraft_color::Rgba::rgb(0x00, 0x80, 0xFF));
     }
 
     #[test]

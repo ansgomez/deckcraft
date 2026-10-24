@@ -31,7 +31,7 @@ ready** (estimated), **10–16 h** to parity.
 | See All Slides grid during the show | yes | yes: G, or All on the show bar; click a thumbnail, Esc closes the grid | Hidden slides are labelled; the first 48 slides are shown |
 | Zoom into part of a slide during the show | yes | yes: Z, then click the slide (or the presenter slide); 2×, Esc or another click leaves it | The presenter keeps the whole slide and draws a frame on the zoomed part |
 | Pen and highlighter ink | yes | pen only (Cmd+P pen, Cmd+A arrow, E erases all ink) | No highlighter, per-stroke eraser, ink colours, or keep/discard annotations prompt |
-| Laser pointer | yes | yes in the show | Cmd/Ctrl+L and the on-screen button draw the show's laser colour and leave no ink. The presenter window does not move that dot |
+| Laser pointer | yes | yes in the show | Cmd/Ctrl+L and the on-screen button draw the show's laser colour (red by default; the bar's swatches and `C` recolour it for the rest of the show) and leave no ink. The presenter window does not move that dot |
 | Subtitles and live captions | yes (cloud speech) | no | AI dimension |
 | Custom shows | yes | yes: Show plays that list in order and does not change Set Up; Set Up Slide Show can keep one for Play from Start | Hidden slides in the list are skipped |
 | Set Up Show: loop until Esc, kiosk (browsed at a kiosk), show without animation/narration, pen colour, slides range | yes | yes, most options | |

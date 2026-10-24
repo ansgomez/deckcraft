@@ -1223,6 +1223,9 @@ impl SlideApp {
             // (which would mean Discard).
             return;
         }
+        // Esc first backs out of the grid, a zoom or a typed slide number; close them so the
+        // Esc below leaves the show and the pending answer cannot linger for a later prompt.
+        show.close_overlays();
         let key =
             |key: egui::Key, pressed: bool| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
         self.synthetic.push(key(egui::Key::Escape, true));

@@ -111,6 +111,9 @@ pub struct ShowInk {
     /// Inside one erase gesture (button held): consecutive `erase_at` calls merge into a
     /// single journal entry, so one sweep is one undo.
     erase_open: bool,
+    /// Journal length when the open erase gesture began: only an entry pushed after it
+    /// belongs to the gesture (an earlier erase, delete or clear is its own undo step).
+    erase_mark: usize,
     /// Selected stroke ids on `select_slide`, worked on by the select tool.
     selected: Vec<u64>,
     select_slide: usize,
@@ -121,6 +124,8 @@ pub struct ShowInk {
     move_open: Option<(usize, Vec<u64>, f32, f32)>,
     pub pen_color: Rgba,
     pub highlighter_color: Rgba,
+    /// The laser pointer's dot and trail (the document's laser colour, red by default).
+    pub laser_color: Rgba,
     pub pen_width: f64,
     pub highlighter_width: f64,
 }
@@ -170,12 +175,14 @@ impl ShowInk {
             next_id: 0,
             active: None,
             erase_open: false,
+            erase_mark: 0,
             selected: vec![],
             select_slide: 0,
             clipboard: vec![],
             move_open: None,
             pen_color,
             highlighter_color: Rgba::rgb(0xFF, 0xE0, 0x00),
+            laser_color: Rgba::rgb(0xFF, 0x00, 0x00),
             pen_width: PEN_WIDTH,
             highlighter_width: HIGHLIGHTER_WIDTH,
         }
@@ -207,6 +214,7 @@ impl ShowInk {
     /// one undo step.
     pub fn start_erase(&mut self) {
         self.erase_open = true;
+        self.erase_mark = self.journal.len();
     }
 
     /// End the erase gesture (button released, slide changed, tool switched).
@@ -218,24 +226,26 @@ impl ShowInk {
         self.strokes.get(&slide).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// The color the active pen/highlighter draws with (the pen color for other tools).
+    /// The color the active pen/highlighter/laser draws with (the pen color for other tools).
     pub fn tool_color(&self) -> Rgba {
         match self.tool {
             ShowTool::Highlighter => self.highlighter_color,
+            ShowTool::Laser => self.laser_color,
             _ => self.pen_color,
         }
     }
 
-    /// Set the active pen/highlighter's color (a no-op for the other tools).
+    /// Set the active pen/highlighter/laser's color (a no-op for the other tools).
     pub fn set_color(&mut self, color: Rgba) {
         match self.tool {
             ShowTool::Highlighter => self.highlighter_color = color,
             ShowTool::Pen => self.pen_color = color,
+            ShowTool::Laser => self.laser_color = color,
             _ => {}
         }
     }
 
-    /// Cycle the active pen/highlighter through the palette (`C` in the show); a color
+    /// Cycle the active pen/highlighter/laser through the palette (`C` in the show); a color
     /// outside the palette (e.g. the document's pen color) jumps to the first entry.
     pub fn cycle_color(&mut self) {
         let cur = self.tool_color();
@@ -479,6 +489,7 @@ impl ShowInk {
         // converting the just-removed positions (against the thinned list) back to positions
         // in the list as it was when the gesture started.
         if self.erase_open
+            && self.journal.len() > self.erase_mark
             && let Some(Op::Erased(s, prior)) = self.journal.last_mut()
             && *s == slide
         {
@@ -1005,12 +1016,14 @@ mod tests {
     }
 
     #[test]
-    fn set_color_only_touches_pen_and_highlighter() {
+    fn set_color_only_touches_pen_highlighter_and_laser() {
         let mut ink = ink();
-        let before = ink.pen_color;
-        ink.set_tool(ShowTool::Pointer);
-        ink.set_color(PALETTE[4].1);
-        assert_eq!(ink.pen_color, before);
+        let before = (ink.pen_color, ink.highlighter_color, ink.laser_color);
+        for tool in [ShowTool::Pointer, ShowTool::Eraser, ShowTool::Select] {
+            ink.set_tool(tool);
+            ink.set_color(PALETTE[4].1);
+        }
+        assert_eq!((ink.pen_color, ink.highlighter_color, ink.laser_color), before);
         ink.set_tool(ShowTool::Pen);
         ink.set_color(PALETTE[4].1);
         assert_eq!(ink.tool_color(), PALETTE[4].1);
@@ -1250,6 +1263,72 @@ mod tests {
         assert_eq!(ink.strokes(0)[0].points[0], (0.1, 0.2));
         assert_eq!(ink.strokes(0)[1].points[0], (0.1, 0.5));
         assert_eq!(ink.strokes(0)[2].points[0], (0.1, 0.8));
+    }
+
+    #[test]
+    fn laser_color_defaults_to_red_and_follows_the_palette() {
+        let mut ink = ink();
+        assert_eq!(ink.laser_color, Rgba::rgb(0xFF, 0x00, 0x00));
+        ink.set_tool(ShowTool::Laser);
+        assert_eq!(ink.tool_color(), Rgba::rgb(0xFF, 0x00, 0x00));
+        ink.set_color(PALETTE[4].1);
+        assert_eq!(ink.laser_color, PALETTE[4].1);
+        // The pen keeps its own color.
+        assert_eq!(ink.pen_color, Rgba::rgb(0xFF, 0x00, 0x00));
+        ink.cycle_color();
+        assert_eq!(ink.laser_color, PALETTE[5].1);
+        // Laser color survives a tool round trip.
+        ink.set_tool(ShowTool::Pen);
+        ink.set_tool(ShowTool::Laser);
+        assert_eq!(ink.tool_color(), PALETTE[5].1);
+    }
+
+    #[test]
+    fn separate_erase_gestures_are_separate_undo_steps() {
+        let mut ink = ink();
+        ink.set_tool(ShowTool::Pen);
+        for y in [0.2f32, 0.5, 0.8] {
+            ink.begin(0, 0.1, y);
+            ink.push(0, 0.9, y);
+            ink.end();
+        }
+        ink.start_erase();
+        assert_eq!(ink.erase_at(0, 0.5, 0.2, 7.2, 720.0, 405.0), 1);
+        ink.end_erase();
+        ink.start_erase();
+        assert_eq!(ink.erase_at(0, 0.5, 0.8, 7.2, 720.0, 405.0), 1);
+        ink.end_erase();
+        // The first undo restores only the second gesture's stroke.
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(0).len(), 2);
+        assert_eq!(ink.strokes(0)[1].points[0], (0.1, 0.8));
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(0).len(), 3);
+    }
+
+    #[test]
+    fn an_erase_gesture_after_a_clear_does_not_merge_into_it() {
+        let mut ink = ink();
+        ink.set_tool(ShowTool::Pen);
+        ink.begin(0, 0.1, 0.2);
+        ink.push(0, 0.9, 0.2);
+        ink.end();
+        ink.begin(0, 0.1, 0.5);
+        ink.push(0, 0.9, 0.5);
+        ink.end();
+        ink.set_tool(ShowTool::Select);
+        assert_eq!(ink.select_in_rect(0, (0.0, 0.1), (1.0, 0.3), false), 1);
+        ink.delete_selection();
+        ink.set_tool(ShowTool::Eraser);
+        ink.start_erase();
+        assert_eq!(ink.erase_at(0, 0.5, 0.5, 7.2, 720.0, 405.0), 1);
+        ink.end_erase();
+        // Undo brings back the erased line only; the deleted one needs its own undo.
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(0).len(), 1);
+        assert_eq!(ink.strokes(0)[0].points[0], (0.1, 0.5));
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(0).len(), 2);
     }
 
     #[test]
